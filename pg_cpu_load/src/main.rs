@@ -7,6 +7,8 @@ use std::{env, process};
 use getopts::Occur;
 use args::Args;
 use std::time::SystemTime;
+use std::thread;
+use std::sync::mpsc;
 
 const PROGRAM_DESC: &'static str = "generate cpu load on a Postgres cluster, and output the TPS.";
 const PROGRAM_NAME: &'static str = "pg_cpu_load";
@@ -90,21 +92,24 @@ fn parse_args() -> Result<args::Args, args::ArgsError> {
     Ok(args)
 }
 
-fn thread(connect_string: String) -> Result<(), args::ArgsError>{
+fn thread(connect_string: String, tx: mpsc::Sender<f32>) -> Result<(), args::ArgsError>{
     let conn = Connection::connect(connect_string, TlsMode::None).unwrap();
     let mut tps: u64 = 1000;
-    let start = SystemTime::now();    
-    for _x in (1..tps).rev() {
-        let _row = &conn.query("SELECT 1", &[]).unwrap();
+    loop {
+        let start = SystemTime::now();    
+        for _x in (1..tps).rev() {
+            let _row = &conn.query("SELECT 1", &[]).unwrap();
+        }
+        let end = SystemTime::now();    
+        let duration_nanos = end.duration_since(start)
+            .expect("Time went backwards").as_nanos();
+        let calc_tps = 10.0_f32.powi(9) * tps as f32 / duration_nanos as f32;
+        println!("From thread: calc_tps: {}", calc_tps);
+        tx.send(calc_tps).unwrap();
+        tps = calc_tps as u64;
+        println!("tps: {}", tps);
     }
-    let end = SystemTime::now();    
-    let duration_nanos = end.duration_since(start)
-        .expect("Time went backwards").as_nanos();
-    let calc_tps = 10.0_f32.powi(9) * tps as f32 / duration_nanos as f32;
-    println!("calc_tps: {}", calc_tps);
-    tps = calc_tps as u64;
-    println!("tps: {}", tps);
-    Ok(())
+    //Ok(())
 }
 
 fn main() -> Result<(), args::ArgsError>{
@@ -117,6 +122,13 @@ fn main() -> Result<(), args::ArgsError>{
 
     let connect_string = postgres_connect_string(args);
     println!("Connectstring: {}", connect_string);
-    thread(connect_string)?;
-    Ok(())
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        thread(connect_string, tx).unwrap();
+    });
+    loop {
+        let calc_tps = rx.recv().unwrap();
+        println!("From main: calc_tps: {}", calc_tps);
+    }
+    //Ok(())
 }
