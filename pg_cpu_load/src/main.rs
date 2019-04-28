@@ -9,6 +9,7 @@ use args::Args;
 use std::time::SystemTime;
 use std::thread;
 use std::sync::mpsc;
+use std::str::FromStr;
 
 const PROGRAM_DESC: &'static str = "generate cpu load on a Postgres cluster, and output the TPS.";
 const PROGRAM_NAME: &'static str = "pg_cpu_load";
@@ -62,10 +63,10 @@ fn parse_args() -> Result<args::Args, args::ArgsError> {
     let input: Vec<String> = env::args().collect();
     let mut args = Args::new(PROGRAM_NAME, PROGRAM_DESC);
     args.flag("?", "help", "Print the usage menu");
-    args.option("p",
-        "port",
-        "Postgres port to connect to",
-        "PGPORT",
+    args.option("d",
+        "dbname",
+        "The database to connect to",
+        "PGDATABASE",
         Occur::Optional,
         None);
     args.option("h",
@@ -74,16 +75,22 @@ fn parse_args() -> Result<args::Args, args::ArgsError> {
         "PGHOST",
         Occur::Optional,
         None);
+    args.option("p",
+        "port",
+        "Postgres port to connect to",
+        "PGPORT",
+        Occur::Optional,
+        None);
+    args.option("P",
+        "parallel",
+        "How much threads to use",
+        "THREADS",
+        Occur::Optional,
+        Some("10".to_string()));
     args.option("U",
         "user",
         "The user to use for the connection",
         "PGUSER",
-        Occur::Optional,
-        None);
-    args.option("d",
-        "dbname",
-        "The database to connect to",
-        "PGDATABASE",
         Occur::Optional,
         None);
 
@@ -92,7 +99,8 @@ fn parse_args() -> Result<args::Args, args::ArgsError> {
     Ok(args)
 }
 
-fn thread(connect_string: String, tx: mpsc::Sender<f32>) -> Result<(), args::ArgsError>{
+fn thread(thread_id: u32, connect_string: String, tx: mpsc::Sender<f32>) -> Result<(), args::ArgsError>{
+    println!("Thread {} started", thread_id);
     let conn = Connection::connect(connect_string, TlsMode::None).unwrap();
     let mut tps: u64 = 1000;
     loop {
@@ -104,15 +112,15 @@ fn thread(connect_string: String, tx: mpsc::Sender<f32>) -> Result<(), args::Arg
         let duration_nanos = end.duration_since(start)
             .expect("Time went backwards").as_nanos();
         let calc_tps = 10.0_f32.powi(9) * tps as f32 / duration_nanos as f32;
-        println!("From thread: calc_tps: {}", calc_tps);
         tx.send(calc_tps).unwrap();
         tps = calc_tps as u64;
-        println!("tps: {}", tps);
     }
     //Ok(())
 }
 
 fn main() -> Result<(), args::ArgsError>{
+    let mut sum_tps: f32;
+    let mut avg_tps: f32;
     let args = parse_args()?;
     let help = args.value_of("help")?;
     if help {
@@ -120,15 +128,28 @@ fn main() -> Result<(), args::ArgsError>{
         process::exit(0);
     }
 
+    let num_threads: String = args.value_of("parallel").unwrap();
+    let num_threads = u32::from_str(&num_threads).unwrap();
+
     let connect_string = postgres_connect_string(args);
     println!("Connectstring: {}", connect_string);
+
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        thread(connect_string, tx).unwrap();
-    });
+    for thread_id in (0..num_threads).rev() {
+        let thread_tx = tx.clone();
+        let thread_connstr = connect_string.clone();
+        thread::spawn(move || {
+            thread(thread_id, thread_connstr, thread_tx).unwrap();
+        });
+    }
+
     loop {
-        let calc_tps = rx.recv().unwrap();
-        println!("From main: calc_tps: {}", calc_tps);
+        sum_tps = 0_f32;
+        for _thread_id in (0..num_threads).rev() {
+             sum_tps += rx.recv().unwrap();
+        }
+        avg_tps = sum_tps / num_threads as f32;
+        println!("Average tps: {}", avg_tps);
     }
     //Ok(())
 }
