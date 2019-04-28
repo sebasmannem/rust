@@ -3,44 +3,57 @@ extern crate args;
 extern crate getopts;
 
 use postgres::{Connection, TlsMode};
-use std::env;
-
+use std::{env, process};
 use getopts::Occur;
 use args::Args;
-use std::process;
+use std::time::SystemTime;
 
 const PROGRAM_DESC: &'static str = "generate cpu load on a Postgres cluster, and output the TPS.";
 const PROGRAM_NAME: &'static str = "pg_cpu_load";
 
-struct Person {
-    id: i32,
-    name: String,
-    data: Option<Vec<u8>>,
-}
-
 fn postgres_param(argument: &Result<String, args::ArgsError>, env_var_key: &String, default: &String) -> String {
-    let argval: String;
+    let mut return_val: String;
+    match env::var(env_var_key) {
+        Ok(val) => return_val = val,
+        Err(_err) => return_val = default.to_string(),
+    }
+    if return_val.is_empty() {
+        return_val = default.to_string()
+    }
     match argument {
-        Ok(val) => argval = val.to_string(),
-        Err(_err) => argval = "".to_string(),
+        Ok(val) => return_val = val.to_string(),
+        Err(_err) => (),
     }
-    if ! argval.is_empty() {
-        return argval;
-    } else {
-        match env::var(env_var_key) {
-            Ok(val) => return val,
-            Err(_err) => return default.to_string(),
-        }
-    }
+    return_val
 }
 
 fn postgres_connect_string(args: args::Args) -> String {
-    let pgport = postgres_param(&args.value_of("PGPORT"), &"PGPORT".to_string(), &"5432".to_string());
-    let pguser = postgres_param(&args.value_of("PGUSER"), &"PGUSER".to_string(), &"postgres".to_string());
-    let pghost = postgres_param(&args.value_of("PGHOST"), &"PGHOST".to_string(), &"localhost".to_string());
-    let pgpassword = postgres_param(&args.value_of("PGPASSWORD"), &"PGPASSWORD".to_string(), &"".to_string());
-    let pgdatabase = postgres_param(&args.value_of("PGDATABASE"), &"PGDATABASE".to_string(), &pguser);
-    return format!("postgres://{user}:{password}@{host}:{port}/{database}", user=pguser, host=pghost, port=pgport, password=pgpassword, database=pgdatabase);
+    let mut connect_string: String;
+    let pgport = postgres_param(&args.value_of("port"), &"PGPORT".to_string(), &"5432".to_string());
+    let pguser = postgres_param(&args.value_of("user"), &"PGUSER".to_string(), &"postgres".to_string());
+    let pghost = postgres_param(&args.value_of("host"), &"PGHOST".to_string(), &"localhost".to_string());
+    let pgpassword = postgres_param(&args.value_of("password"), &"PGPASSWORD".to_string(), &"".to_string());
+    let pgdatabase = postgres_param(&args.value_of("dbname"), &"PGDATABASE".to_string(), &pguser);
+//  postgresql://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]
+    connect_string = "postgres://".to_string();
+    if ! pguser.is_empty() {
+        connect_string.push_str(&pguser);
+        if ! pgpassword.is_empty() {
+            connect_string.push_str(":");
+            connect_string.push_str(&pgpassword);
+        }
+        connect_string.push_str("@");
+    }
+    connect_string.push_str(&pghost);
+    if ! pgport.is_empty() {
+        connect_string.push_str(":");
+        connect_string.push_str(&pgport);
+    }
+    if ! pgdatabase.is_empty() {
+        connect_string.push_str("/");
+        connect_string.push_str(&pgdatabase);
+    }
+    connect_string
 }
 
 fn parse_args() -> Result<args::Args, args::ArgsError> {
@@ -77,36 +90,33 @@ fn parse_args() -> Result<args::Args, args::ArgsError> {
     Ok(args)
 }
 
+fn thread(connect_string: String) -> Result<(), args::ArgsError>{
+    let conn = Connection::connect(connect_string, TlsMode::None).unwrap();
+    let mut tps: u64 = 1000;
+    let start = SystemTime::now();    
+    for _x in (1..tps).rev() {
+        let _row = &conn.query("SELECT 1", &[]).unwrap();
+    }
+    let end = SystemTime::now();    
+    let duration_nanos = end.duration_since(start)
+        .expect("Time went backwards").as_nanos();
+    let calc_tps = 10.0_f32.powi(9) * tps as f32 / duration_nanos as f32;
+    println!("calc_tps: {}", calc_tps);
+    tps = calc_tps as u64;
+    println!("tps: {}", tps);
+    Ok(())
+}
+
 fn main() -> Result<(), args::ArgsError>{
     let args = parse_args()?;
     let help = args.value_of("help")?;
     if help {
-        args.full_usage();
+        println!("{}", args.full_usage());
         process::exit(0);
     }
 
     let connect_string = postgres_connect_string(args);
     println!("Connectstring: {}", connect_string);
-    let conn = Connection::connect(connect_string, TlsMode::None).unwrap();
-    conn.execute("CREATE TABLE person (
-                    id              SERIAL PRIMARY KEY,
-                    name            VARCHAR NOT NULL,
-                    data            BYTEA
-                  )", &[]).unwrap();
-    let me = Person {
-        id: 0,
-        name: "Steven".to_string(),
-        data: None,
-    };
-    conn.execute("INSERT INTO person (name, data) VALUES ($1, $2)",
-                 &[&me.name, &me.data]).unwrap();
-    for row in &conn.query("SELECT id, name, data FROM person", &[]).unwrap() {
-        let person = Person {
-            id: row.get(0),
-            name: row.get(1),
-            data: row.get(2),
-        };
-        println!("Found person {}", person.name);
-    }
+    thread(connect_string)?;
     Ok(())
 }
