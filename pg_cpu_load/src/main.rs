@@ -8,7 +8,7 @@ use getopts::Occur;
 use args::Args;
 use std::time::SystemTime;
 use std::thread;
-use std::sync::mpsc;
+use std::sync::{mpsc, RwLock, Arc};
 use std::str::FromStr;
 
 const PROGRAM_DESC: &'static str = "generate cpu load on a Postgres cluster, and output the TPS.";
@@ -95,7 +95,7 @@ fn parse_args() -> Result<args::Args, args::ArgsError> {
         None);
     args.option("t",
         "query_type",
-        "The type of query to run: empty, simple, read, write",
+        "The type of query to run: empty, simple, temp_read, temp_write, read, write",
         "QTYPE",
         Occur::Optional,
         Some("simple".to_string()));
@@ -105,32 +105,34 @@ fn parse_args() -> Result<args::Args, args::ArgsError> {
         "STYPE",
         Occur::Optional,
         Some("direct".to_string()));
+    args.option("n",
+        "num_secs",
+        "The number of tests to run. Every test takes one second.",
+        "NUMSEC",
+        Occur::Optional,
+        Some("10".to_string()));
     args.parse(input)?;
 
     Ok(args)
 }
 
-fn thread(thread_id: u32, tx: mpsc::Sender<f32>) -> Result<(), Box<std::error::Error>>{
-    println!("Thread {} started", thread_id);
+fn thread(thread_id: u32, tx: mpsc::Sender<f32>, thread_lock: std::sync::Arc<std::sync::RwLock<bool>> ) -> Result<(), Box<std::error::Error>>{
+    // println!("Thread {} started", thread_id);
     let args = parse_args()?;
 
-    let qtype: String = args.value_of("query_type").unwrap();
+    let qtype: String = args.value_of("query_type")?;
+    let stype: String = args.value_of("statement_type")?;
     let query: String;
     match qtype.as_ref() {
         "empty" => query = "".to_string(),
         "simple" => query = "SELECT $1".to_string(),
-        "read" => query = "SELECT ID from my_temp_table WHERE ID = $1".to_string(),
-        "write" => query = "UPDATE my_temp_table set ID = $1 WHERE ID = $1".to_string(),
+        "temp_read" => query = "SELECT ID from my_temp_table WHERE ID = $1".to_string(),
+        "temp_write" => query = "UPDATE my_temp_table set ID = $1 WHERE ID = $1".to_string(),
+        "read" => query = format!("SELECT ID from my_table_{} WHERE ID = $1", thread_id).to_string(),
+        "write" => query = format!("UPDATE my_table_{} set ID = $1 WHERE ID = $1", thread_id).to_string(),
         _ => panic!("Option QTYPE should be one of empty, simple, read, write (not {}).", qtype),
     }
 
-    let stype: String = args.value_of("statement_type")?;
-    if stype != "prepared" && stype != "prepared_transactional" && stype != "transactional" && stype != "direct" {
-        panic!("Option STYPE should be one of direct, prepared, transactional, prepared_transactional (not {}).", stype);
-    }
-    if qtype == "empty" && stype != "prepared_transactional" && stype != "transactional" {
-        panic!("Option QTYPE-empty only works with transactions.");
-    }
 
     let connect_string = postgres_connect_string(args);
     if thread_id == 0 {
@@ -141,14 +143,23 @@ fn thread(thread_id: u32, tx: mpsc::Sender<f32>) -> Result<(), Box<std::error::E
     let conn = Connection::connect(connect_string, TlsMode::None)?;
     let mut tps: u64 = 1000;
 
-    if qtype == "read" || qtype == "write" {
+    if qtype == "temp_read" || qtype == "temp_write" {
         conn.execute("create temporary table my_temp_table (id oid)", &[])?;
         conn.execute("insert into my_temp_table values($1)", &[&thread_id])?;
+    } else if qtype == "read" || qtype == "write" {
+        conn.execute(&format!("create table if not exists my_table_{} (id oid)", thread_id), &[])?;
+        conn.execute(&format!("truncate my_table_{}", thread_id), &[])?;
+        conn.execute(&format!("insert into my_table_{} values($1)", thread_id), &[&thread_id])?;
     }
-
     loop {
+        if let Ok(done) = thread_lock.read() {
+            // done is true when main thread decides we are there
+            if *done {
+                break;
+            }
+        }
         let start = SystemTime::now();    
-        for _x in (1..tps).rev() {
+        for _x in 1..tps {
             if stype == "prepared" {
                 let prep = conn.prepare_cached(&query)?;
                 let _row = prep.query(&[&thread_id]);
@@ -176,7 +187,8 @@ fn thread(thread_id: u32, tx: mpsc::Sender<f32>) -> Result<(), Box<std::error::E
         tx.send(calc_tps)?;
         tps = calc_tps as u64;
     }
-    //Ok(())
+    // println!("Thread {} stopped", thread_id);
+    Ok(())
 }
 
 fn main() -> Result<(), Box<std::error::Error>> {
@@ -188,26 +200,54 @@ fn main() -> Result<(), Box<std::error::Error>> {
         println!("{}", args.full_usage());
         process::exit(0);
     }
+    let stype: String = args.value_of("statement_type")?;
+    if stype != "prepared" && stype != "prepared_transactional" && stype != "transactional" && stype != "direct" {
+        panic!("Option STYPE should be one of direct, prepared, transactional, prepared_transactional (not {}).", stype);
+    }
+    let qtype: String = args.value_of("query_type")?;
+    if qtype != "empty" && qtype != "simple" && qtype != "temp_read" && qtype != "temp_write" && qtype != "read" && qtype != "write" {
+        panic!("Option QTYPE should be one of empty, simple, temp_read, temp_write, read, write (not {}).", qtype);
+    } else if qtype == "empty" && stype != "prepared_transactional" && stype != "transactional" {
+        panic!("Option QTYPE-empty only works with transactions.");
+    }
+
 
     let num_threads: String = args.value_of("parallel")?;
     let num_threads = u32::from_str(&num_threads)?;
+    let num_secs: String = args.value_of("num_secs")?;
+    let num_secs = u32::from_str(&num_secs)?;
 
     let (tx, rx) = mpsc::channel();
-    for thread_id in (0..num_threads).rev() {
-        let thread_tx = tx.clone();
-        thread::spawn(move || {
-            thread(thread_id, thread_tx).unwrap();
-        });
-    }
+    let rw_lock = Arc::new(RwLock::new(false));
+    let mut threads = Vec::with_capacity(num_threads as usize);
 
-    loop {
+    for thread_id in 0..num_threads {
+        let thread_tx = tx.clone();
+        let thread_lock = rw_lock.clone();
+        let thread_handle =  thread::spawn(move || {
+            thread(thread_id, thread_tx, thread_lock).unwrap();
+        });
+        threads.push(thread_handle);
+    }
+    for _ in 0..num_secs {
         sum_tps = 0_f32;
-        for _thread_id in (0..num_threads).rev() {
+        for _thread_id in 0..num_threads {
              sum_tps += rx.recv()?;
         }
         avg_tps = sum_tps / num_threads as f32;
         println!("Average tps: {}", avg_tps);
         println!("Total tps: {}", sum_tps);
     }
-    //Ok(())
+
+    let main_lock = rw_lock.clone();
+    if let Ok(mut done) = main_lock.write() {
+        // println!("Stopping all threads");
+        *done = true;
+    }
+
+    for thread_handle in threads {
+        thread_handle.join().unwrap();
+    }
+
+    Ok(())
 }
