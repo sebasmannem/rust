@@ -202,7 +202,7 @@ fn sample(conn: &Connection, query: &String, tps: u64, stype: &String, thread_id
     Ok(num_queries)
 }
 
-fn thread(thread_id: u32, tx: mpsc::Sender<u64>, thread_lock: std::sync::Arc<std::sync::RwLock<bool>> ) -> Result<(), Box<std::error::Error>>{
+fn thread_procedure(thread_id: u32, tx: mpsc::Sender<u64>, thread_lock: std::sync::Arc<std::sync::RwLock<bool>> ) -> Result<(), Box<std::error::Error>>{
     // println!("Thread {} started", thread_id);
     let args = parse_args()?;
 
@@ -267,16 +267,17 @@ fn thread(thread_id: u32, tx: mpsc::Sender<u64>, thread_lock: std::sync::Arc<std
 fn downscale(rx: mpsc::Receiver<u64>, tx: mpsc::Sender<u64>, thread_lock: std::sync::Arc<std::sync::RwLock<bool>>) -> Result<(), Box<std::error::Error>>{
     //With more threads (> 500) we have some issues, where the one main thread cannot consume messages fast enough.
     //This function can downscal from 25 messages to 1 message.
-    let mut sum: u64;
+    let mut sum: u64 = 0;
     let wait = Duration::from_millis(10);
     loop {
-        if let Ok(done) = thread_lock.read() {
-            // done is true when main thread decides we are there
-            if *done {
-                break;
-            }
-        }
-        sum = 0;
+        match thread_lock.read() {
+            Ok(done) => {
+                if *done {
+                        break;
+                }
+            },
+            Err(_err) => (),
+        };
         for _ in 0..25 {
             match rx.recv_timeout(wait) {
                 Ok(sample_tps) => {
@@ -285,7 +286,10 @@ fn downscale(rx: mpsc::Receiver<u64>, tx: mpsc::Sender<u64>, thread_lock: std::s
                 Err(_err) => (),
             };
         }
-        tx.send(sum)?;
+        match tx.send(sum) {
+            Ok(_) => sum = 0,
+            Err(_err) => (),
+        };
     }
     Ok(())
 }
@@ -331,9 +335,9 @@ fn main() -> Result<(), Box<std::error::Error>> {
         for thread_id in 0..num_threads {
             let thread_tx = tx.clone();
             let thread_lock = rw_lock.clone();
-            let thread_handle =  thread::spawn(move || {
-                thread(thread_id, thread_tx, thread_lock).unwrap();
-            });
+            let thread_handle =  thread::Builder::new().name(format!("child{}", thread_id).to_string()).spawn(move || {
+                thread_procedure(thread_id, thread_tx, thread_lock).unwrap();
+            }).unwrap();
             threads.push(thread_handle);
         }
         num_samples = num_threads / 10;
@@ -349,16 +353,16 @@ fn main() -> Result<(), Box<std::error::Error>> {
                 downscale_tx = tmp_tx;
                 let thread_lock = rw_downscaler_lock.clone();
                 let thread_tx = tx.clone();
-                let thread_handle =  thread::spawn(move || {
+                let thread_handle =  thread::Builder::new().name(format!("downscale{}", thread_id).to_string()).spawn(move || {
                     downscale(downscale_rx, thread_tx, thread_lock).unwrap();
-                });
+                }).unwrap();
                 downscale_threads.push(thread_handle);
             }
             let thread_tx = downscale_tx.clone();
             let thread_lock = rw_lock.clone();
-            let thread_handle =  thread::spawn(move || {
-                thread(thread_id, thread_tx, thread_lock).unwrap();
-            });
+            let thread_handle =  thread::Builder::new().name(format!("child{}", thread_id).to_string()).spawn(move || {
+                thread_procedure(thread_id, thread_tx, thread_lock).unwrap();
+            }).unwrap();
             threads.push(thread_handle);
         }
         num_samples = num_threads / 250;
@@ -422,7 +426,6 @@ fn main() -> Result<(), Box<std::error::Error>> {
 
     let main_lock = rw_lock.clone();
     if let Ok(mut done) = main_lock.write() {
-        // println!("Stopping all threads");
         *done = true;
     }
 
